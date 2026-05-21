@@ -50,7 +50,7 @@ mkdir "${base_dir}/${raid}"
 
 cd "${base_dir}/${raid}"
 
-mkdir -p errout ref vcf \
+mkdir -p errout ref vcf/plots \
          mds/plots mds/candidates \
          local_pca/raw local_pca/tables local_pca/plots local_pca/axis_scores \
          local_pca/collapsed \
