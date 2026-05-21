@@ -10,7 +10,7 @@ min_chr_length=10000000    # minimum scaffold length to include (bp); filters ou
 # VCF filtering
 MIN_QUAL=30    # minimum site QUAL score
 MIN_GQ=20      # minimum sample genotype quality
-MIN_DP=5       # minimum sample read depth
+MIN_DP=3       # minimum sample read depth
 GENO=0.3       # maximum missingness per site (plink2 --geno)
 MAF=0.01       # minimum minor allele frequency
 
