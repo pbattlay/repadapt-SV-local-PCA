@@ -85,7 +85,7 @@ awk -v min="${min_chr_length}" '$2 >= min { print $1 }' \
 ```
 
 ## Script 1 — filter and impute
-Runs as a SLURM array (one task per chromosome). For each chromosome, the script filters the input VCF (designed for RepAdapt 'raw' VCFs) for genotype quality and depth, missingness, MAF, and biallelic SNPs, imputes missing data with BEAGLE, and outputs a PLINK BED fileset. Intermediate VCFs are removed on completion. Note that if a VCF doesn't contain the correct INFO fields, filtering will remove all varaints!
+Runs as a SLURM array (one task per chromosome). For each chromosome, the script filters the input VCF (designed for RepAdapt 'raw' VCFs) for genotype quality and depth, missingness, MAF, and biallelic SNPs, imputes missing data with BEAGLE, and outputs a PLINK BED fileset. Intermediate VCFs are removed on completion. If not using a verified RepAdapt VCF, check that your VCF contains the correct INFO fields.
 ```bash
 cd ${base_dir}
 
@@ -93,11 +93,11 @@ sbatch --account="${account}" \
     --job-name="s1_${raid}" \
     --array="1-$(wc -l < ${base_dir}/${raid}/ref/chrs.txt)" \
     -D "${base_dir}/${raid}" \
-    "${base_dir}/scripts/script1.sh" "${base_dir}/${base_dir}/config_${raid}.sh"
+    "${base_dir}/scripts/script1.sh" "${base_dir}/config_${raid}.sh"
 ```
 
-## Script 1b - diagnostic plots
-Runs a single SLURM job, produces diagnostic plots only to `${base_dir}/vcf/plots` (not required for script2)
+## Script 1b
+Runs a single SLURM job, produces diagnostic plots only to `${base_dir}/${raid}/vcf/plots`, not required for script2
 - `scaffold_sizes.pdf` histogram of reference scaffold size distribution with `min_chr_length` filter marked
 - `snps_per_window.pdf` histogram of SNP counts per window distribution with `MIN_SNPS_PER_WINDOW` marked
 - `pca.pdf` scatterplot of PC1 and PC2 (100k random SNPs post-filtering)
@@ -126,7 +126,7 @@ sbatch --account="${account}" \
 ```
 
 ## Script 3 - merge results
-Runs a single SLURM job to merge outputs across chromosomes, collect plots for surviving SV candidates and asses genome-wide LD between candidates.
+Runs a single SLURM job to merge outputs across chromosomes, collect plots for surviving SV candidates and assess genome-wide LD between candidates.
 
 ```bash
 sbatch --account="${account}" \
@@ -146,3 +146,14 @@ rm -f ${base_dir}/${raid}/breakpoints/*/*
 rm -f ${base_dir}/${raid}/final/*
 rm -f ${base_dir}/${raid}/final/*/*
 ```
+
+## Results
+A final list of candidate regions and their genotypes are written to `${base_dir}/${raid}/final/${raid}_merged.tsv` and `${base_dir}/${raid}/final/${raid}_merged_genotypes.tsv` respectively. Between SV LD is written and plotted to `${base_dir}/${raid}/final/${raid}_LD_heatmap.*`.
+
+# MDS plots
+MDS plots for final candidates can be found in `${base_dir}/${raid}/final/plots/`. Blue bars show MDS scan candidate region, red bars show LD-refined regions, green bars (if present) show region merged across multiple candidate regions. MDS scan plots for all candidates before filtering can be found in `${base_dir}/${raid}/mds/plots/` and `${base_dir}/${raid}/breakpoints/plots/`
+<img width="1500" height="420" alt="h1s7_h1s7_60600001_67920000_bp" src="https://github.com/user-attachments/assets/2c5bfa2d-ee47-49e5-b0e6-cf30320fa4d1" />
+
+# Local PCA plots
+Local PCA plots for final candidates can be found in `${base_dir}/${raid}/final/plots/`; initial plots for all MDS candidates can be found in `${base_dir}/${raid}/local_pca/plots/`
+<img width="1300" height="1040" alt="h1s7_h1s7_60600001_67920000_lp" src="https://github.com/user-attachments/assets/703b4626-0726-4eec-881d-d45ffcf7b80d" />
