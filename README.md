@@ -74,8 +74,8 @@ BEGIN { OFS="\t" }
 
 Not all VCF headers will contain this information (but RepAdapt VCFs will). If you can't get contig length information from the VCF header, use a FASTA index
 ```bash
-fai=""
-awk '{print $1"\t"$2}' $fai > ${base_dir}/${raid}/ref/contigs.tsv
+#fai=""
+#awk '{print $1"\t"$2}' $fai > ${base_dir}/${raid}/ref/contigs.tsv
 ```
 
 Make a list of 'chromosomes' (scaffolds >= `min_chr_length`)
