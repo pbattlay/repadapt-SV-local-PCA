@@ -58,7 +58,7 @@ mkdir -p ${base_dir}/${raid}/errout \
          ${base_dir}/${raid}/local_pca/axis_scores \
          ${base_dir}/${raid}/local_pca/collapsed \
          ${base_dir}/${raid}/breakpoints/plots \
-         ${base_dir}/${raid}/final/plots \
+         ${base_dir}/${raid}/final/plots
 ```
 
 ### Chromosome names
