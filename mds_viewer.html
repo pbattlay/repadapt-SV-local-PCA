@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MDS Scan Viewer</title>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#f6f8fa; --border:#d9dee4; --ink:#1f2733;
+    --muted:#6b7682; --blue:#4393C3; --blue-dim:rgba(67,147,195,.72);
+    --red:#D6604D; --grid:#edf0f4;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink); background:var(--bg);
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }
+  header{
+    display:flex; flex-wrap:wrap; gap:14px; align-items:center;
+    padding:10px 14px; border-bottom:1px solid var(--border); background:var(--panel);
+  }
+  header .group{display:flex; align-items:center; gap:7px;}
+  .title{font-weight:600; font-size:14px; letter-spacing:.01em; margin-right:4px;}
+  label{font-size:12.5px; color:var(--muted);}
+  select,button,input[type=number]{
+    font-size:13px; padding:5px 9px; border:1px solid var(--border);
+    border-radius:6px; background:#fff; color:var(--ink);
+  }
+  input[type=number]{width:62px;}
+  select:disabled,button:disabled,input:disabled{opacity:.5; cursor:default;}
+  button{cursor:pointer;}
+  button:not(:disabled):hover{background:#eef1f5;}
+  .filebtn{position:relative; overflow:hidden; display:inline-block;}
+  .filebtn input{position:absolute; inset:0; opacity:0; cursor:pointer;}
+  .filebtn button{background:var(--blue); border-color:var(--blue); color:#fff; font-weight:500;}
+  .filebtn:hover button{background:#3a83b0;}
+  #status{font-size:12px; color:var(--muted); margin-left:auto; max-width:38%; text-align:right;}
+  main{flex:1; display:flex; min-height:0;}
+  #plotwrap{flex:1; position:relative; min-width:0; background:#fff;}
+  canvas{display:block; width:100%; height:100%; cursor:crosshair;}
+  aside{
+    width:296px; flex:none; border-left:1px solid var(--border);
+    background:var(--panel); padding:14px 16px; overflow:auto;
+  }
+  aside h2{
+    font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+    color:var(--muted); margin:0 0 8px;
+  }
+  .row{
+    display:flex; justify-content:space-between; align-items:center; gap:10px;
+    padding:7px 0; border-bottom:1px solid var(--grid);
+  }
+  .row .k{font-size:12px; color:var(--muted); white-space:nowrap;}
+  .row .vwrap{display:flex; align-items:center; gap:7px; min-width:0;}
+  .row .v{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px; user-select:all; -webkit-user-select:all; word-break:break-all;
+  }
+  .empty{color:var(--muted); font-size:13px; line-height:1.5;}
+  .hint{font-size:11px; color:var(--muted); line-height:1.65; margin-top:16px;
+        border-top:1px dashed var(--border); padding-top:12px;}
+  .hint b{color:var(--ink); font-weight:600;}
+  kbd{font-family:ui-monospace,Menlo,Consolas,monospace; font-size:10.5px;
+      background:#fff; border:1px solid var(--border); border-radius:4px; padding:0 4px;}
+</style>
+</head>
+<body>
+<header>
+  <span class="title">MDS Scan Viewer</span>
+  <span class="filebtn">
+    <button type="button">Select mds/ folder…</button>
+    <input id="dir" type="file" webkitdirectory directory multiple>
+  </span>
+  <div class="group"><label for="chr">Chromosome</label><select id="chr" disabled></select></div>
+  <div class="group"><label for="axis">MDS axis</label><select id="axis" disabled></select></div>
+  <button id="reset" type="button" disabled>Reset zoom</button>
+  <div class="group"><label for="zthr">MAD-Z &gt;</label><input id="zthr" type="number" value="5" step="0.5" min="0" disabled></div>
+  <span id="status">No folder loaded.</span>
+</header>
+<main>
+  <div id="plotwrap"><canvas id="cv"></canvas></div>
+  <aside>
+    <h2>Selected window</h2>
+    <div id="readout"><p class="empty">Click a point to read off its window coordinates.</p></div>
+    <div class="hint">
+      <b>Navigate:</b> scroll to zoom · drag to box-zoom · <kbd>Shift</kbd>+drag to pan · double-click to reset.<br><br>
+      <b>Pick:</b> click a point to show its window; the values are selectable. Windows with |MAD-Z| above the threshold are drawn in dark goldenrod. A block's left edge is some window's <i>window_start</i>; its right edge another window's <i>window_end</i>.
+    </div>
+  </aside>
+</main>
+<script>
+"use strict";
+(function(){
+  const cv       = document.getElementById('cv');
+  const ctx      = cv.getContext('2d');
+  const dirInput = document.getElementById('dir');
+  const chrSel   = document.getElementById('chr');
+  const axisSel  = document.getElementById('axis');
+  const resetBtn = document.getElementById('reset');
+  const zthrInput= document.getElementById('zthr');
+  const statusEl = document.getElementById('status');
+  const readoutEl= document.getElementById('readout');
+  const plotwrap = document.getElementById('plotwrap');
+
+  let store    = {};     // name -> chromosome data
+  let chrOrder = [];     // naturally-sorted chromosome names
+  let cur      = null;   // current chromosome data
+  let curAxis  = null;   // current MDS axis name
+  let view     = null;   // {xmin,xmax,ymin,ymax} in data coords
+  let selected = null;   // index of selected point in cur arrays, or null
+  let dpr      = window.devicePixelRatio || 1;
+  let cssW = 0, cssH = 0;
+  let zThr     = 5;      // |MAD-Z| outlier threshold (matches header box)
+  let curStats = null;   // {ok, med, scale} for current chromosome + axis
+
+  const margin = {l:66, r:18, t:16, b:48};
+
+  // ---------------------------------------------------------------- parsing
+  function parseMDS(text){
+    const lines = text.split(/\r?\n/);
+    let hi = 0;
+    while(hi < lines.length && lines[hi].trim() === '') hi++;
+    if(hi >= lines.length) return null;
+    const header = lines[hi].split('\t').map(h => h.trim());
+    const idx = {};
+    header.forEach((h,i) => { idx[h] = i; });
+    for(const n of ['window_start','window_mid','window_end','n_snps'])
+      if(!(n in idx)) return null;
+    const mdsCols = header.filter(h => /^MDS\d+$/.test(h));
+    if(!mdsCols.length) return null;
+
+    const ws=[], wm=[], we=[], ns=[];
+    const mds = {}, finite = {};
+    mdsCols.forEach(c => { mds[c]=[]; finite[c]=false; });
+    const chrIdx = ('chr' in idx) ? idx['chr'] : -1;
+    let chrName = null;
+
+    for(let r=hi+1; r<lines.length; r++){
+      const line = lines[r];
+      if(line === '') continue;
+      const f = line.split('\t');
+      if(f.length < header.length) continue;
+      const m = +f[idx['window_mid']];
+      if(!isFinite(m)) continue;
+      ws.push(+f[idx['window_start']]);
+      wm.push(m);
+      we.push(+f[idx['window_end']]);
+      ns.push(+f[idx['n_snps']]);
+      if(chrName === null && chrIdx >= 0) chrName = f[chrIdx];
+      for(const c of mdsCols){
+        const v = parseFloat(f[idx[c]]);
+        const ok = isFinite(v);
+        mds[c].push(ok ? v : NaN);
+        if(ok) finite[c] = true;
+      }
+    }
+    if(!wm.length) return null;
+    return {
+      chr: chrName, n: wm.length,
+      window_start: ws, window_mid: wm, window_end: we, n_snps: ns,
+      mds: mds, axes: mdsCols.slice().sort(naturalCompare)
+    };
+  }
+
+  // natural sort so chr2 < chr10, MDS2 < MDS10
+  function naturalCompare(a,b){
+    const ax = String(a).match(/(\d+|\D+)/g) || [String(a)];
+    const bx = String(b).match(/(\d+|\D+)/g) || [String(b)];
+    const n = Math.min(ax.length, bx.length);
+    for(let i=0;i<n;i++){
+      const an = parseInt(ax[i],10), bn = parseInt(bx[i],10);
+      if(!isNaN(an) && !isNaN(bn)){ if(an !== bn) return an - bn; }
+      else if(ax[i] !== bx[i]) return ax[i] < bx[i] ? -1 : 1;
+    }
+    return ax.length - bx.length;
+  }
+
+  // ---------------------------------------------------------------- loading
+  dirInput.addEventListener('click', () => { dirInput.value = ''; });
+  dirInput.addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []).filter(f => /\.mds$/i.test(f.name));
+    if(!files.length){ statusEl.textContent = 'No .mds files found in that folder.'; return; }
+    statusEl.textContent = 'Loading ' + files.length + ' file(s)…';
+    store = {}; chrOrder = [];
+    let loaded = 0, skipped = 0;
+    for(const file of files){
+      try{
+        const d = parseMDS(await file.text());
+        if(!d){ skipped++; continue; }
+        d.name = file.name.replace(/\.mds$/i, '');
+        store[d.name] = d;
+        loaded++;
+      } catch(err){ skipped++; }
+    }
+    chrOrder = Object.keys(store).sort(naturalCompare);
+    if(!chrOrder.length){
+      statusEl.textContent = 'Could not parse any .mds files.';
+      chrSel.disabled = axisSel.disabled = resetBtn.disabled = zthrInput.disabled = true;
+      cur = null; curAxis = null; view = null; clearReadout(); draw();
+      return;
+    }
+    chrSel.innerHTML = '';
+    for(const c of chrOrder){
+      const o = document.createElement('option');
+      o.value = c; o.textContent = c; chrSel.appendChild(o);
+    }
+    chrSel.disabled = axisSel.disabled = resetBtn.disabled = zthrInput.disabled = false;
+    statusEl.textContent = loaded + ' chromosome(s) loaded' + (skipped ? ('  ·  ' + skipped + ' skipped') : '');
+    curAxis = null;
+    selectChrom(chrOrder[0]);
+  });
+
+  function selectChrom(name){
+    cur = store[name];
+    chrSel.value = name;
+    const prev = curAxis;
+    axisSel.innerHTML = '';
+    for(const ax of cur.axes){
+      const o = document.createElement('option');
+      o.value = ax; o.textContent = ax; axisSel.appendChild(o);
+    }
+    curAxis = cur.axes.includes(prev) ? prev : (cur.axes[0] || null);
+    axisSel.value = curAxis;
+    selected = null; clearReadout();
+    computeStats();
+    resetView();
+  }
+
+  chrSel.addEventListener('change', () => selectChrom(chrSel.value));
+  axisSel.addEventListener('change', () => {
+    curAxis = axisSel.value; selected = null; clearReadout(); computeStats(); resetView();
+  });
+  resetBtn.addEventListener('click', resetView);
+  zthrInput.addEventListener('input', () => {
+    const v = parseFloat(zthrInput.value);
+    zThr = (isFinite(v) && v >= 0) ? v : 0;
+    if(selected != null) updateReadout();
+    requestDraw();
+  });
+
+  // ---------------------------------------------------------------- MAD-Z
+  // Matches script2 detect_candidates: z = (val - median) / (1.4826 * MAD)
+  function median(arr){
+    const a = arr.slice().sort((x,y) => x-y);
+    const n = a.length;
+    if(!n) return NaN;
+    const m = n >> 1;
+    return (n & 1) ? a[m] : (a[m-1]+a[m]) / 2;
+  }
+  function computeStats(){
+    curStats = {ok:false, med:NaN, scale:NaN};
+    if(!cur || !curAxis) return;
+    const ys = cur.mds[curAxis];
+    const v = [];
+    for(let i=0;i<cur.n;i++){ const y = ys[i]; if(isFinite(y)) v.push(y); }
+    if(!v.length) return;
+    const med = median(v);
+    const dev = v.map(y => Math.abs(y-med));
+    const mad = median(dev);
+    curStats = (isFinite(mad) && mad > 0)
+      ? {ok:true,  med:med, scale:1/(mad*1.4826)}
+      : {ok:false, med:med, scale:NaN};        // mad==0: defined median, no outliers
+  }
+  function madz(i){
+    if(!curStats || !curStats.ok) return NaN;
+    const y = cur.mds[curAxis][i];
+    return isFinite(y) ? (y - curStats.med) * curStats.scale : NaN;
+  }
+
+  // ---------------------------------------------------------------- view
+  function resetView(){
+    if(!cur){ view = null; draw(); return; }
+    const xs = cur.window_mid;
+    let xmin=Infinity, xmax=-Infinity;
+    for(let i=0;i<cur.n;i++){
+      const x = xs[i];
+      if(x<xmin) xmin=x; if(x>xmax) xmax=x;
+    }
+    if(!isFinite(xmin)){ xmin=0; xmax=1; }
+    const xpad = (xmax-xmin)*0.02 || 1;
+    view = {xmin:xmin-xpad, xmax:xmax+xpad, ymin:-1, ymax:1};
+    draw();
+  }
+
+  function plotRect(){
+    return {x:margin.l, y:margin.t, w:cssW-margin.l-margin.r, h:cssH-margin.t-margin.b};
+  }
+  const xToPx = (x,pr) => pr.x + (x-view.xmin)/(view.xmax-view.xmin)*pr.w;
+  const yToPx = (y,pr) => pr.y + (1-(y-view.ymin)/(view.ymax-view.ymin))*pr.h;
+  const pxToX = (px,pr) => view.xmin + (px-pr.x)/pr.w*(view.xmax-view.xmin);
+  const pxToY = (py,pr) => view.ymin + (1-(py-pr.y)/pr.h)*(view.ymax-view.ymin);
+  const clamp = (v,a,b) => v<a ? a : (v>b ? b : v);
+
+  // ---------------------------------------------------------------- ticks
+  function niceTicks(min,max,target){
+    const span = max-min;
+    if(!(span>0)) return [min];
+    const raw = span/target;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const norm = raw/mag;
+    let step = (norm<1.5 ? 1 : norm<3 ? 2 : norm<7 ? 5 : 10) * mag;
+    const start = Math.ceil(min/step)*step;
+    const out = [];
+    for(let v=start; v<=max+step*0.5; v+=step) out.push(v);
+    return out;
+  }
+
+  // ---------------------------------------------------------------- draw
+  let rafPending = false;
+  function requestDraw(){
+    if(rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => { rafPending = false; draw(); });
+  }
+
+  function draw(){
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,cssW,cssH);
+    const pr = plotRect();
+    if(pr.w<=0 || pr.h<=0) return;
+
+    if(!cur || !curAxis || !view){
+      ctx.fillStyle = '#6b7682';
+      ctx.font = '13px -apple-system,Segoe UI,Roboto,sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(cur ? 'No finite values on this axis.' : 'Select an mds/ folder to begin.',
+                   cssW/2, cssH/2);
+      return;
+    }
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(pr.x, pr.y, pr.w, pr.h);
+
+    // axes, gridlines, labels
+    const spanMb = (view.xmax-view.xmin)/1e6;
+    const xdec = spanMb>=20 ? 1 : spanMb>=2 ? 2 : spanMb>=0.2 ? 3 : 4;
+    const spanY = view.ymax-view.ymin;
+    const ydec = spanY>=20 ? 1 : spanY>=2 ? 2 : spanY>=0.2 ? 3 : spanY>=0.02 ? 4 : 5;
+
+    ctx.lineWidth = 1;
+    ctx.font = '11px -apple-system,Segoe UI,Roboto,sans-serif';
+
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    for(const t of niceTicks(view.xmin, view.xmax, 8)){
+      const px = xToPx(t,pr);
+      if(px < pr.x-1 || px > pr.x+pr.w+1) continue;
+      ctx.strokeStyle = '#edf0f4';
+      ctx.beginPath(); ctx.moveTo(px,pr.y); ctx.lineTo(px,pr.y+pr.h); ctx.stroke();
+      ctx.fillStyle = '#6b7682';
+      ctx.fillText((t/1e6).toFixed(xdec), px, pr.y+pr.h+7);
+    }
+
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for(const t of niceTicks(view.ymin, view.ymax, 6)){
+      const py = yToPx(t,pr);
+      if(py < pr.y-1 || py > pr.y+pr.h+1) continue;
+      ctx.strokeStyle = '#edf0f4';
+      ctx.beginPath(); ctx.moveTo(pr.x,py); ctx.lineTo(pr.x+pr.w,py); ctx.stroke();
+      ctx.fillStyle = '#6b7682';
+      ctx.fillText(Math.abs(t)<1e-12 ? '0' : t.toFixed(ydec), pr.x-9, py);
+    }
+
+    // points (clipped): grey base (grey40 @ .6, as script2), goldenrod outliers on top
+    ctx.save();
+    ctx.beginPath(); ctx.rect(pr.x,pr.y,pr.w,pr.h); ctx.clip();
+    const xs = cur.window_mid, ys = cur.mds[curAxis];
+    const canFlag = !!(curStats && curStats.ok);
+    const med = curStats ? curStats.med : 0, scale = curStats ? curStats.scale : 0;
+
+    ctx.fillStyle = 'rgba(102,102,102,.6)';
+    for(let i=0;i<cur.n;i++){
+      const y = ys[i]; if(!isFinite(y)) continue;
+      const x = xs[i];
+      if(x<view.xmin||x>view.xmax||y<view.ymin||y>view.ymax) continue;
+      if(canFlag && Math.abs((y-med)*scale) > zThr) continue;
+      const px = xToPx(x,pr), py = yToPx(y,pr);
+      ctx.beginPath(); ctx.arc(px,py,2.3,0,6.283185307); ctx.fill();
+    }
+    if(canFlag){
+      ctx.fillStyle = 'rgba(184,134,11,.95)';   // dark goldenrod
+      for(let i=0;i<cur.n;i++){
+        const y = ys[i]; if(!isFinite(y)) continue;
+        const x = xs[i];
+        if(x<view.xmin||x>view.xmax||y<view.ymin||y>view.ymax) continue;
+        if(Math.abs((y-med)*scale) <= zThr) continue;
+        const px = xToPx(x,pr), py = yToPx(y,pr);
+        ctx.beginPath(); ctx.arc(px,py,2.9,0,6.283185307); ctx.fill();
+      }
+    }
+    if(selected != null && isFinite(ys[selected])){
+      const sy = ys[selected];
+      const px = xToPx(xs[selected],pr), py = yToPx(sy,pr);
+      const isOut = canFlag && Math.abs((sy-med)*scale) > zThr;
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(px,py,7,0,6.283185307); ctx.fill();
+      ctx.fillStyle = isOut ? 'rgb(184,134,11)' : 'rgb(102,102,102)';
+      ctx.beginPath(); ctx.arc(px,py,3.4,0,6.283185307); ctx.fill();
+      ctx.lineWidth = 1.8; ctx.strokeStyle = '#D6604D';
+      ctx.beginPath(); ctx.arc(px,py,6,0,6.283185307); ctx.stroke();
+    }
+    ctx.restore();
+
+    if(!curStats || !isFinite(curStats.med)){
+      ctx.fillStyle = '#9aa3ad';
+      ctx.font = '12px -apple-system,Segoe UI,Roboto,sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('No finite values on this axis.', pr.x+pr.w/2, pr.y+pr.h/2);
+    }
+
+    // box-zoom rectangle
+    if(dragMode === 'box' && dragRect){
+      const x0=Math.min(dragRect.x0,dragRect.x1), y0=Math.min(dragRect.y0,dragRect.y1);
+      const w=Math.abs(dragRect.x1-dragRect.x0), h=Math.abs(dragRect.y1-dragRect.y0);
+      ctx.fillStyle = 'rgba(67,147,195,.12)';
+      ctx.strokeStyle = 'rgba(67,147,195,.85)';
+      ctx.lineWidth = 1;
+      ctx.fillRect(x0,y0,w,h); ctx.strokeRect(x0,y0,w,h);
+    }
+
+    // border + axis titles
+    ctx.strokeStyle = '#d9dee4'; ctx.lineWidth = 1;
+    ctx.strokeRect(pr.x,pr.y,pr.w,pr.h);
+    ctx.fillStyle = '#1f2733';
+    ctx.font = '12px -apple-system,Segoe UI,Roboto,sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText('Genomic position (Mb)  —  ' + cur.name, pr.x+pr.w/2, cssH-6);
+    ctx.save();
+    ctx.translate(15, pr.y+pr.h/2); ctx.rotate(-Math.PI/2);
+    ctx.textBaseline = 'top'; ctx.textAlign = 'center';
+    ctx.fillText(curAxis, 0, 0);
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------- interaction
+  let dragMode=null, dragRect=null, dragStart=null, moved=false;
+
+  function evtPos(e){
+    const r = cv.getBoundingClientRect();
+    return {x:e.clientX-r.left, y:e.clientY-r.top};
+  }
+
+  cv.addEventListener('mousedown', (e) => {
+    if(!view) return;
+    const p = evtPos(e), pr = plotRect();
+    if(p.x<pr.x||p.x>pr.x+pr.w||p.y<pr.y||p.y>pr.y+pr.h) return;
+    moved = false;
+    if(e.shiftKey){
+      dragMode = 'pan';
+      dragStart = {x:p.x, y:p.y, view:Object.assign({}, view)};
+    } else {
+      dragMode = 'box';
+      dragRect = {x0:p.x, y0:p.y, x1:p.x, y1:p.y};
+    }
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if(!dragMode || !view) return;
+    const p = evtPos(e), pr = plotRect();
+    if(dragMode === 'box'){
+      if(Math.abs(p.x-dragRect.x0)>3 || Math.abs(p.y-dragRect.y0)>3) moved = true;
+      dragRect.x1 = clamp(p.x, pr.x, pr.x+pr.w);
+      dragRect.y1 = clamp(p.y, pr.y, pr.y+pr.h);
+      requestDraw();
+    } else {
+      const v = dragStart.view;
+      const ddx = (p.x-dragStart.x)/pr.w*(v.xmax-v.xmin);
+      const ddy = (p.y-dragStart.y)/pr.h*(v.ymax-v.ymin);
+      view = {xmin:v.xmin-ddx, xmax:v.xmax-ddx, ymin:v.ymin+ddy, ymax:v.ymax+ddy};
+      requestDraw();
+    }
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if(!dragMode) return;
+    const mode = dragMode; dragMode = null;
+    if(mode === 'box'){
+      const rect = dragRect; dragRect = null;
+      if(moved && rect){
+        const pr = plotRect();
+        const x0=Math.min(rect.x0,rect.x1), x1=Math.max(rect.x0,rect.x1);
+        const y0=Math.min(rect.y0,rect.y1), y1=Math.max(rect.y0,rect.y1);
+        if(x1-x0>4 && y1-y0>4){
+          view = {
+            xmin: pxToX(x0,pr), xmax: pxToX(x1,pr),
+            ymin: pxToY(y1,pr), ymax: pxToY(y0,pr)   // y1 (lower pixel) = ymin
+          };
+        }
+        draw();
+      } else {
+        selectNear(evtPos(e));
+      }
+    } else {
+      draw();
+    }
+  });
+
+  cv.addEventListener('wheel', (e) => {
+    if(!view) return;
+    const pr = plotRect(), p = evtPos(e);
+    if(p.x<pr.x||p.x>pr.x+pr.w||p.y<pr.y||p.y>pr.y+pr.h) return;
+    e.preventDefault();
+    const factor = Math.exp(e.deltaY * 0.0015);   // deltaY>0 (scroll down) -> zoom out
+    const cx = pxToX(p.x,pr), cy = pxToY(p.y,pr);
+    view = {
+      xmin: cx-(cx-view.xmin)*factor, xmax: cx+(view.xmax-cx)*factor,
+      ymin: cy-(cy-view.ymin)*factor, ymax: cy+(view.ymax-cy)*factor
+    };
+    requestDraw();
+  }, {passive:false});
+
+  cv.addEventListener('dblclick', (e) => { e.preventDefault(); resetView(); });
+
+  function selectNear(p){
+    if(!cur || !curAxis || !view) return;
+    const pr = plotRect();
+    const xs = cur.window_mid, ys = cur.mds[curAxis];
+    let best=-1, bestd=144;   // 12px radius squared
+    for(let i=0;i<cur.n;i++){
+      const y = ys[i]; if(!isFinite(y)) continue;
+      const x = xs[i];
+      if(x<view.xmin||x>view.xmax||y<view.ymin||y>view.ymax) continue;
+      const px = xToPx(x,pr), py = yToPx(y,pr);
+      const d = (px-p.x)*(px-p.x)+(py-p.y)*(py-p.y);
+      if(d<bestd){ bestd=d; best=i; }
+    }
+    if(best>=0){ selected=best; updateReadout(); draw(); }
+  }
+
+  // ---------------------------------------------------------------- readout
+  function esc(s){
+    return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  }
+  function clearReadout(){
+    readoutEl.innerHTML = '<p class="empty">Click a point to read off its window coordinates.</p>';
+  }
+  function fmtMDS(v){ return isFinite(v) ? String(v) : 'NA'; }
+  function fmtZ(z){ return isFinite(z) ? (z>=0?'+':'') + z.toFixed(2) : '—'; }
+
+  function updateReadout(){
+    const i = selected;
+    const z = madz(i);
+    const isOut = isFinite(z) && Math.abs(z) > zThr;
+    const rows = [
+      ['chromosome',       cur.name],
+      ['MDS axis',         curAxis],
+      ['window_start',     String(cur.window_start[i])],
+      ['window_mid',       String(cur.window_mid[i])],
+      ['window_end',       String(cur.window_end[i])],
+      ['n_snps',           String(cur.n_snps[i])],
+      [curAxis + ' value', fmtMDS(cur.mds[curAxis][i])],
+      ['MAD-Z',            fmtZ(z) + (isOut ? '  (outlier)' : '')]
+    ];
+    let html = '';
+    for(const [k,v] of rows){
+      const out = (k === 'MAD-Z' && isOut);
+      html += '<div class="row"><span class="k">' + esc(k) + '</span>'
+            + '<span class="vwrap"><span class="v"' + (out ? ' style="color:#B8860B"' : '') + '>'
+            + esc(v) + '</span></span></div>';
+    }
+    readoutEl.innerHTML = html;
+  }
+
+  // ---------------------------------------------------------------- sizing
+  function resize(){
+    cssW = plotwrap.clientWidth;
+    cssH = plotwrap.clientHeight;
+    dpr  = window.devicePixelRatio || 1;
+    cv.width  = Math.max(1, Math.round(cssW*dpr));
+    cv.height = Math.max(1, Math.round(cssH*dpr));
+    draw();
+  }
+  new ResizeObserver(resize).observe(plotwrap);
+  window.addEventListener('resize', resize);
+  resize();
+})();
+</script>
+</body>
+</html>

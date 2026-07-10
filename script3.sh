@@ -15,6 +15,8 @@ module load R
 
 mkdir -p "final/plots"
 
+export TRUTH_SET="${TRUTH_SET:-}"
+
 Rscript --vanilla - "${raid}" << 'REOF'
 suppressPackageStartupMessages({
   library(data.table)
@@ -124,6 +126,11 @@ if (n_cands < 2L) {
   s_lo <- -0.45
   s_hi <- -0.07
 
+  # Canvas grows with candidate count; scale fonts + colourbar with it (no cap, so
+  # per-tile resolution is preserved) — else labels/legend vanish at fit-to-page.
+  pdf_dim <- max(6, n_cands * 0.22 + 3)
+  sf      <- pdf_dim / 6
+
   ht <- ggplot(r2_dt, aes(x = x_idx, y = y_idx, fill = r2)) +
 
     # Chromosome annotation strips — annotate() bypasses aes() so no scale conflict
@@ -148,7 +155,9 @@ if (n_cands < 2L) {
       low      = "white", high = "#D6604D",
       limits   = c(0, 1), name = expression(r^2),
       breaks   = c(0, 0.25, 0.5, 0.75, 1),
-      na.value = "grey85"
+      na.value = "grey85",
+      guide    = guide_colourbar(barwidth  = unit(0.35 * sf, "in"),
+                                 barheight = unit(2.5  * sf, "in"))
     ) +
 
     # Axes: chromosome labels at group midpoints
@@ -162,20 +171,112 @@ if (n_cands < 2L) {
     ) +
 
     coord_fixed() +
-    theme_minimal(base_size = 9) +
+    theme_minimal(base_size = 9 * sf) +
     theme(
-      axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
-      axis.text.y     = element_text(size = 8),
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = 8 * sf),
+      axis.text.y     = element_text(size = 8 * sf),
       axis.title      = element_blank(),
       panel.grid      = element_blank(),
+      legend.title    = element_text(size = 11 * sf),
+      legend.text     = element_text(size = 8 * sf),
       legend.position = "right",
       plot.margin     = margin(5, 10, 5, 5)
     )
 
-  pdf_dim <- max(6, n_cands * 0.22 + 3)
   out_hm  <- sprintf("final/%s_LD_heatmap.pdf", raid)
   ggsave(out_hm, ht, width = pdf_dim, height = pdf_dim, limitsize = FALSE)
   message(sprintf("[heatmap] → %s (%.1f × %.1f in)", out_hm, pdf_dim, pdf_dim))
+}
+
+# =============================================================
+# SECTION 3b — Genome overview (candidates per chromosome)
+# =============================================================
+# One chromosome per row; per candidate, vertically + horizontally nested bars:
+# merged (green) over LD/bp (red) over MDS (blue). Backbones span every analysis
+# scaffold (contigs.tsv). Optional truth track (gold) from TRUTH_SET — chr,start,end,
+# 1-based, no header. Runs for any candidate count (>=1).
+if (!file.exists("ref/contigs.tsv")) {
+  message("[overview] ref/contigs.tsv not found — skipping overview")
+} else {
+  contigs <- fread("ref/contigs.tsv", header = FALSE, col.names = c("chr", "length"))
+  ov_chrs <- chrs[chrs %in% contigs$chr]                     # analysis scaffolds, chrs.txt order
+  back    <- contigs[chr %in% ov_chrs]
+  back[, chr := factor(chr, levels = ov_chrs)]
+  setorder(back, chr)
+  back[, cy := length(ov_chrs) - as.integer(chr) + 1L]       # first chr at top
+  cy_map  <- setNames(back$cy, as.character(back$chr))
+
+  mv <- copy(merged)
+  mv[, cy := cy_map[as.character(chr)]]
+
+  # Uniform-thickness lanes stacked per chromosome (like the MDS-scan plots) rather
+  # than centered/nested — order top->bottom follows pipeline: truth, MDS, LD ext, merged.
+  bh <- 0.06                                       # uniform bar half-height
+  lanes <- rbindlist(list(
+    mv[, .(cy, xmin = start,        xmax = end,        center = cy + 0.09, type = "MDS")],
+    mv[, .(cy, xmin = bp_start,     xmax = bp_end,     center = cy - 0.09, type = "LD extension")],
+    mv[, .(cy, xmin = merged_start, xmax = merged_end, center = cy - 0.27, type = "merged")]
+  ), use.names = TRUE)
+
+  # Optional truth track: neutral, not coloured — a black bar above plus a
+  # translucent grey region shade (as in the parameter-sweep plots).
+  tshade     <- NULL
+  truth_path <- Sys.getenv("TRUTH_SET")
+  if (nzchar(truth_path) && file.exists(truth_path) && file.info(truth_path)$size > 0) {
+    truth_dt <- tryCatch(
+      fread(truth_path, header = FALSE,
+            colClasses = c("character", "integer", "integer"),
+            col.names = c("chr", "start", "end")),
+      error = function(e) { message("[overview] could not read TRUTH_SET (", e$message, ")"); NULL })
+    if (!is.null(truth_dt)) {
+      truth_dt <- truth_dt[chr %in% ov_chrs]
+      if (nrow(truth_dt)) {
+        truth_dt[, cy := cy_map[as.character(chr)]]
+        lanes  <- rbindlist(list(lanes,
+          truth_dt[, .(cy, xmin = start, xmax = end, center = cy + 0.27, type = "truth")]),
+          use.names = TRUE)
+        tshade <- truth_dt[, .(cy, xmin = start, xmax = end)]      # grey region highlight
+        message(sprintf("[overview] %d truth region(s) overlaid", nrow(truth_dt)))
+      }
+    }
+  }
+
+  # Colours standardised with the MDS-scan plots; truth neutral (black).
+  lane_levels <- c("truth", "MDS", "LD extension", "merged")
+  pal         <- c(truth = "black", MDS = "steelblue",
+                   `LD extension` = "firebrick", merged = "forestgreen")
+  lanes[, type := factor(type, levels = lane_levels)]
+  present     <- lane_levels[lane_levels %in% as.character(lanes$type)]
+
+  ov <- ggplot() +
+    geom_segment(data = back,
+                 aes(x = 0, xend = length / 1e6, y = cy, yend = cy),
+                 color = "grey80", linewidth = 0.6)
+  if (!is.null(tshade))
+    ov <- ov + geom_rect(data = tshade,
+                         aes(xmin = xmin / 1e6, xmax = xmax / 1e6,
+                             ymin = cy - 0.36, ymax = cy + 0.36),
+                         fill = "grey70", alpha = 0.4)
+  ov <- ov +
+    geom_rect(data = lanes,
+              aes(xmin = xmin / 1e6, xmax = xmax / 1e6,
+                  ymin = center - bh, ymax = center + bh, fill = type)) +
+    scale_fill_manual(values = pal, limits = lane_levels, breaks = present, name = NULL) +
+    scale_y_continuous(breaks = back$cy, labels = as.character(back$chr),
+                       expand = c(0, 0.6)) +
+    scale_x_continuous(expand = c(0.02, 0)) +
+    labs(x = "Position (Mb)", y = NULL,
+         title    = sprintf("%s — candidates per chromosome", raid),
+         subtitle = if (!is.null(tshade)) "truth = black bar + grey region" else NULL) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.minor   = element_blank(),
+          legend.position    = "top")
+
+  ov_h   <- max(4, length(ov_chrs) * 0.45 + 1.5)
+  out_ov <- sprintf("final/%s_overview.pdf", raid)
+  ggsave(out_ov, ov, width = 12, height = ov_h, limitsize = FALSE)
+  message(sprintf("[overview] %d chromosomes → %s", length(ov_chrs), out_ov))
 }
 
 # =============================================================

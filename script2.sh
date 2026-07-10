@@ -19,9 +19,10 @@ export CHR="${chr}"
 export WINDOW_SIZE MIN_SNPS_PER_WINDOW
 export K_MDS NPC_DIST Z_THRESH WINDOW_GAP MIN_WIN N_PERM PERM_P
 export MIN_CLUSTER_N MIN_SEARCH_N MIN_GAP_SCALED_CUTOFF GAP_PRODUCT_SCALED_CUTOFF
-export HET_P_CUTOFF HET_MIN_GROUP_N PREFER_UNROTATED UNROTATED_MARGIN
+export HET_P_CUTOFF HET_MIN_GROUP_N
 export DIP_P_THRESH R2_K3_MIN COR_H_AXIS_MAX MIN_INV_FREQ
-export LD_BIN_SIZE COLLAPSE_BUFFER LD_MIN_SNR
+export LD_BIN_SIZE COLLAPSE_BUFFER LD_MIN_SNR R_THRESH R_THRESH_LONG LD_EXT_FRAC
+export MANUAL_CANDIDATES="${MANUAL_CANDIDATES:-}"
 
 Rscript --vanilla - << 'RSCRIPT'
 
@@ -52,15 +53,16 @@ min_gap_scaled_cutoff  <- as.numeric(Sys.getenv("MIN_GAP_SCALED_CUTOFF"))
 gap_prod_scaled_cutoff <- as.numeric(Sys.getenv("GAP_PRODUCT_SCALED_CUTOFF"))
 het_p_cutoff           <- as.numeric(Sys.getenv("HET_P_CUTOFF"))
 het_min_group_n        <- as.integer(Sys.getenv("HET_MIN_GROUP_N"))
-prefer_unrotated       <- toupper(Sys.getenv("PREFER_UNROTATED")) %in% c("TRUE","T","1","YES")
-unrotated_margin       <- as.numeric(Sys.getenv("UNROTATED_MARGIN"))
 dip_p_thresh           <- as.numeric(Sys.getenv("DIP_P_THRESH"))
 r2_k3_min              <- as.numeric(Sys.getenv("R2_K3_MIN"))
 cor_h_axis_max         <- as.numeric(Sys.getenv("COR_H_AXIS_MAX"))
 min_inv_freq           <- as.numeric(Sys.getenv("MIN_INV_FREQ"))
 ld_bin_size            <- as.integer(Sys.getenv("LD_BIN_SIZE"))
 ld_min_snr             <- as.numeric(Sys.getenv("LD_MIN_SNR", unset = "10"))
-collapse_buffer        <- as.numeric(Sys.getenv("COLLAPSE_BUFFER", unset = "0.1"))
+collapse_buffer        <- as.numeric(Sys.getenv("COLLAPSE_BUFFER", unset = "Inf")) # physical bp gap; Inf = chromosome-wide
+r_thresh               <- as.numeric(Sys.getenv("R_THRESH", unset = "0.8"))        # Section C (overlap) collapse only
+r_thresh_long          <- as.numeric(Sys.getenv("R_THRESH_LONG", unset = "0.9"))   # Section D2 long-range collapse
+ld_ext_frac            <- as.numeric(Sys.getenv("LD_EXT_FRAC", unset = "0.25"))
 
 ts <- function() format(Sys.time(), "%H:%M:%S")
 cat(sprintf("[%s] R started — %s\n", ts(), chr))
@@ -99,12 +101,18 @@ detect_candidates <- function(mds, axes, z_thresh, window_gap, min_win, n_perm, 
       p_val  <- mean(L_perm >= L_obs)
       if (p_val >= perm_p) next
 
+      # Per-run length floor from the same permutation null: a run must be longer
+      # than the longest streak noise produces at this window_gap / K / N. This
+      # tracks window_gap automatically (no need to retune min_win when the gap
+      # changes); min_win remains the hard lower bound for the SV size floor.
+      run_floor <- max(min_win, as.integer(ceiling(quantile(L_perm, 1 - perm_p))))
+
       gaps   <- diff(flag_idx) - 1L
       run_id <- cumsum(c(1L, gaps > window_gap))
 
       for (rid in unique(run_id)) {
         sel <- run_id == rid
-        if (sum(sel) < min_win) next
+        if (sum(sel) < run_floor) next
         idx   <- flag_idx[sel]
         z_run <- abs(z[idx])
         results[[length(results) + 1L]] <- data.frame(
@@ -115,6 +123,7 @@ detect_candidates <- function(mds, axes, z_thresh, window_gap, min_win, n_perm, 
           dir             = dir,
           n_windows       = sum(sel),
           K               = K,
+          run_floor       = run_floor,
           peak_z          = round(max(z_run),  2),
           mean_z          = round(mean(z_run), 2),
           sd_z            = round(sd(z_run),   2),
@@ -281,9 +290,7 @@ cluster_local_pca_gaps <- function(df,
                                    dip_p_thresh          = 0.05,
                                    r2_k3_min             = 0.85,
                                    cor_h_axis_max        = 0.5,
-                                   min_inv_freq          = 0.03,
-                                   prefer_unrotated      = TRUE,
-                                   unrotated_margin      = 0.95) {
+                                   min_inv_freq          = 0.03) {
   df <- as.data.table(copy(df))
   df[, PC1_rot45 := (PC1 - PC2) / sqrt(2)]
   df[, PC2_rot45 := (PC1 + PC2) / sqrt(2)]
@@ -307,13 +314,9 @@ cluster_local_pca_gaps <- function(df,
     if (!nrow(fallback)) stop("no valid 3-cluster split found on any axis")
     setorder(fallback, -min_gap_scaled, -gap_product_scaled)
     best <- fallback[1]
-  } else if (prefer_unrotated) {
-    top_score <- max(passing$min_gap_scaled, na.rm = TRUE)
-    unrot <- passing[axis %in% c("PC1", "PC2") &
-                     min_gap_scaled >= unrotated_margin * top_score]
-    if (nrow(unrot)) { setorder(unrot, -min_gap_scaled, -gap_product_scaled); best <- unrot[1] }
-    else             { setorder(passing, -min_gap_scaled, -gap_product_scaled); best <- passing[1] }
   } else {
+    # Highest gap-score among all four axes (PC1, PC2 and their 45-deg rotations);
+    # no preference for unrotated axes.
     setorder(passing, -min_gap_scaled, -gap_product_scaled); best <- passing[1]
   }
 
@@ -430,7 +433,12 @@ assign_genotypes <- function(region_id, lpca_axis, L_end, MID_end) {
 }
 
 collapse_candidates <- function(cands, geno_mat, r_thresh = 0.8) {
-  ord      <- order(cands$n_windows, decreasing = TRUE)
+  # Representative = WIDEST candidate (physical span), source-agnostic so a manual
+  # region's full extent wins over a narrower correlated MDS fragment; ties prefer
+  # the MDS candidate (real axis/stats). This is the only place a non-representative's
+  # coordinates are dropped (D2 unions extents), so span here is necessary + sufficient.
+  src_rank <- if ("candidate_source" %in% names(cands)) (cands$candidate_source != "mds") else logical(nrow(cands))
+  ord      <- order(cands$end - cands$start, src_rank, decreasing = c(TRUE, FALSE), method = "radix")
   cands    <- cands[ord]; geno_mat <- geno_mat[ord, , drop = FALSE]
   group    <- rep(NA_integer_, nrow(cands)); gid <- 1L
   for (i in seq_len(nrow(cands))) {
@@ -449,11 +457,11 @@ collapse_candidates <- function(cands, geno_mat, r_thresh = 0.8) {
     best[, supporting_axes := paste(unique(sub$axis), collapse = ",")]
     best[, n_collapsed      := nrow(sub)]
     best
-  }))[order(-n_windows)]
+  }))[order(-(end - start))]
 }
 
-collapse_candidates_bp <- function(bp_table, geno_wide, r_thresh = 0.8,
-                                   buffer_frac = 0.10) {
+collapse_candidates_bp <- function(bp_table, geno_wide, r_thresh = 0.9,
+                                   max_gap = Inf) {
   # Sort by R2_k3: best-clustering representative chosen when merging
   ord   <- order(bp_table$R2_k3, decreasing = TRUE, na.last = TRUE)
   cands <- bp_table[ord]
@@ -461,28 +469,45 @@ collapse_candidates_bp <- function(bp_table, geno_wide, r_thresh = 0.8,
     as.numeric(geno_wide[[rid]])))
   rownames(geno_mat) <- cands$region_id
 
-  group <- rep(NA_integer_, nrow(cands)); gid <- 1L
-  for (i in seq_len(nrow(cands))) {
-    if (!is.na(group[i])) next
-    group[i] <- gid
+  n <- nrow(cands)
+
+  # ---- Single-linkage grouping (union-find) ------------------------------------
+  # Replaces the earlier seed/star grouping, which measured the gap from one seed to
+  # every other candidate and assigned in a single hop. That fragmented large real
+  # inversions two ways: a block wider than max_gap could not be held together by a
+  # seed sitting off-centre, and a bridge fragment was consumed by whichever seed
+  # reached it first, so an r=1.0 block could fracture at its midpoint.
+  #
+  # Here every PAIR is linked iff its edge-to-edge physical gap is <= max_gap AND
+  # |genotype r| >= r_thresh; groups are the connected components of that graph.
+  # Linkage is transitive, so a chain of consecutive linked fragments merges as one
+  # block even when the outermost members are far apart and decorrelated-at-distance.
+  # A single inversion broken into pieces — or split by an internal detection hole
+  # (centromere/repeat stretch with no callable window) narrower than max_gap —
+  # re-assembles. The r gate halts a chain at the inversion boundary, where the next
+  # locus decorrelates. max_gap therefore only needs to bridge the largest WITHIN-
+  # block hole, not span the block diameter; distinct-but-near loci are held apart by
+  # the r gate, and the Section-D2 re-cluster/trim guard backstops any over-reach.
+  # Candidates with NA bp coords never link, so they remain singletons (as before).
+  parent <- seq_len(n)
+  find <- function(x) { while (parent[x] != x) x <- parent[x]; x }
+  for (i in seq_len(n - 1L)) {
     bi <- cands[i]
-    if (is.na(bi$bp_start) || is.na(bi$bp_end)) { gid <- gid + 1L; next }
-    buf_i <- (bi$bp_end - bi$bp_start) * buffer_frac
-    for (j in seq_len(nrow(cands))) {
-      if (i == j || !is.na(group[j])) next
+    if (is.na(bi$bp_start) || is.na(bi$bp_end)) next
+    for (j in seq(i + 1L, n)) {
       bj <- cands[j]
       if (is.na(bj$bp_start) || is.na(bj$bp_end)) next
-      buf_j <- (bj$bp_end - bj$bp_start) * buffer_frac
-      # Overlap check with proportional buffer — allows nearby fragments of the
-      # same SV to merge even when a TE gap prevents exact coordinate overlap;
-      # genotype correlation still required so independent SVs are not joined
-      if ((bi$bp_end + buf_i) < (bj$bp_start - buf_j) ||
-          (bi$bp_start - buf_i) > (bj$bp_end + buf_j)) next
+      # edge-to-edge gap (0 when the intervals overlap); physical bp, not proportional
+      gap <- max(0, bj$bp_start - bi$bp_end, bi$bp_start - bj$bp_end)
+      if (gap > max_gap) next
       r <- cor(geno_mat[i, ], geno_mat[j, ], use = "pairwise.complete.obs")
-      if (!is.na(r) && abs(r) >= r_thresh) group[j] <- gid
+      if (!is.na(r) && abs(r) >= r_thresh) {
+        ri <- find(i); rj <- find(j)
+        if (ri != rj) parent[rj] <- ri   # cands is R2_k3-sorted; lower index keeps the root
+      }
     }
-    gid <- gid + 1L
   }
+  group <- vapply(seq_len(n), find, integer(1))
 
   # Per-fragment annotation: merged_start/end = union of group
   merge_map <- rbindlist(lapply(unique(group), function(g) {
@@ -529,7 +554,8 @@ compute_ld_chr <- function(geno_c, sd_g, samp, inv_geno, bim, bin_size) {
   data.table(pos = bin_mid[valid], mean_r2 = round(as.numeric(r2_by_bin), 4))
 }
 
-find_breakpoints <- function(profile, cand_start, cand_end, ld_min_snr = 10) {
+find_breakpoints <- function(profile, cand_start, cand_end, ld_min_snr = 10,
+                             ld_ext_frac = 0.25) {
   ord <- order(profile$pos)
   pos <- profile$pos[ord]; r2v <- profile$mean_r2[ord]; n <- length(r2v)
   if (sum(!is.na(r2v)) < 3) return(list(bp_start = cand_start, bp_end = cand_end,
@@ -555,7 +581,7 @@ find_breakpoints <- function(profile, cand_start, cand_end, ld_min_snr = 10) {
                 bg_r2 = round(bg_r2, 4), sig_r2 = round(sig_r2, 4)))
   }
 
-  thresh <- bg_r2 + (sig_r2 - bg_r2) * 0.25
+  thresh <- bg_r2 + (sig_r2 - bg_r2) * ld_ext_frac
 
   # Anchor scan at the peak smoothed r2 within the MDS candidate — more robust
   # than the geometric centre when the candidate covers only part of an inversion
@@ -596,56 +622,156 @@ find_breakpoints <- function(profile, cand_start, cand_end, ld_min_snr = 10) {
        bg_r2 = round(bg_r2, 4), sig_r2 = round(sig_r2, 4))
 }
 
-plot_mds_with_breakpoints <- function(mds_dt, chr, mds_start, mds_end,
-                                      bp_start, bp_end,
-                                      merged_start = NA_integer_, merged_end = NA_integer_,
-                                      n_merged = 1L,
-                                      axis, dir, out_file) {
+plot_mds_with_breakpoints <- function(mds_dt, chr, frags, merged_start, merged_end,
+                                      n_merged, axis, dir, out_file) {
+  # frags: data.table with one row per collapsed fragment (start,end = MDS extent;
+  # bp_start,bp_end = LD-refined extent). All fragments are drawn (blue = MDS,
+  # red = LD refined); the green bar is the merged union when n_merged > 1.
   ax_vals <- mds_dt[[axis]]
   y_range <- range(ax_vals, na.rm = TRUE); y_span <- diff(y_range)
   bar_y   <- y_range[2] + y_span * 0.07
-  bar_gap <- y_span * 0.04
+  bar_gap <- y_span * 0.045
 
-  has_bp     <- !is.na(bp_start) && !is.na(bp_end)
   was_merged <- isTRUE(n_merged > 1L) && !is.na(merged_start) && !is.na(merged_end)
-  # Green bar always drawn when n_merged > 1; may overlap red when coords identical
-  # (three bars = merged, two bars = not merged — unambiguous regardless of overlap)
-  has_merge  <- has_bp && was_merged
 
-  title_str <- sprintf("%s:%d-%d [%s %s]  refined:%s-%s",
-                       chr, mds_start, mds_end, axis, dir,
-                       if (has_bp) as.character(bp_start) else "NA",
-                       if (has_bp) as.character(bp_end)   else "NA")
-  if (was_merged)
-    title_str <- paste0(title_str, sprintf("  merged:%d-%d [n=%d]",
-                        merged_start, merged_end, n_merged))
-
-  sub_str <- if (has_merge)
-    "blue = MDS candidate  |  red = LD refined  |  green = merged union"
+  title_str <- sprintf("%s:%d-%d [%s %s]  (%d fragment%s)",
+                       chr, as.integer(merged_start), as.integer(merged_end),
+                       axis, dir, nrow(frags), if (nrow(frags) > 1L) "s" else "")
+  sub_str <- if (was_merged)
+    "blue = MDS candidates  |  red = LD refined  |  green = merged union"
   else
     "blue = MDS candidate  |  red = LD refined"
 
-  n_bars <- 1L + has_bp + has_merge
-  y_top  <- bar_y + y_span * 0.03
-  y_bot  <- y_range[1] - y_span * 0.05
-
   p <- ggplot(mds_dt, aes(x = window_mid, y = .data[[axis]])) +
-    geom_point(size = 0.3, colour = "grey40", alpha = 0.6) +
-    annotate("segment", x = mds_start, xend = mds_end,
-             y = bar_y, yend = bar_y, colour = "steelblue", linewidth = 2.5)
-  if (has_bp)
-    p <- p + annotate("segment", x = bp_start, xend = bp_end,
-                      y = bar_y - bar_gap, yend = bar_y - bar_gap,
-                      colour = "firebrick", linewidth = 2.5)
-  if (has_merge)
+    geom_point(size = 0.3, colour = "grey40", alpha = 0.6)
+
+  # Every fragment's MDS (blue) and LD-refined (red) bars
+  for (k in seq_len(nrow(frags))) {
+    p <- p + annotate("segment", x = frags$start[k], xend = frags$end[k],
+                      y = bar_y, yend = bar_y, colour = "steelblue", linewidth = 2.5)
+    if (!is.na(frags$bp_start[k]) && !is.na(frags$bp_end[k]))
+      p <- p + annotate("segment", x = frags$bp_start[k], xend = frags$bp_end[k],
+                        y = bar_y - bar_gap, yend = bar_y - bar_gap,
+                        colour = "firebrick", linewidth = 2.5)
+  }
+  if (was_merged)
     p <- p + annotate("segment", x = merged_start, xend = merged_end,
                       y = bar_y - 2 * bar_gap, yend = bar_y - 2 * bar_gap,
                       colour = "forestgreen", linewidth = 2.5)
+
   p <- p +
-    coord_cartesian(ylim = c(y_bot, y_top + (n_bars - 1) * bar_gap)) +
+    coord_cartesian(ylim = c(y_range[1] - y_span * 0.05, bar_y + y_span * 0.05)) +
     theme_classic(base_size = 10) +
     labs(title = title_str, subtitle = sub_str, x = "Genomic position", y = axis)
   ggsave(out_file, p, width = 10, height = 2.8, dpi = 150)
+}
+
+# Best MDS axis to display a candidate on: among the candidate's supporting axes,
+# the one whose windows inside the region are most outlying (highest mean |Z|).
+best_axis_for_region <- function(mds_dt, r_start, r_end, cand_axes) {
+  cand_axes <- unique(cand_axes[cand_axes %in% names(mds_dt)])
+  if (!length(cand_axes)) return(NA_character_)
+  inwin <- mds_dt$window_mid >= r_start & mds_dt$window_mid <= r_end
+  if (!any(inwin)) return(cand_axes[1])
+  scores <- vapply(cand_axes, function(ax) {
+    v   <- mds_dt[[ax]]
+    med <- median(v, na.rm = TRUE); mad <- median(abs(v - med), na.rm = TRUE)
+    if (!is.finite(mad) || mad == 0) return(NA_real_)
+    z <- (v - med) / (mad * 1.4826)
+    mean(abs(z[inwin]), na.rm = TRUE)
+  }, numeric(1))
+  if (all(is.na(scores))) return(cand_axes[1])
+  cand_axes[which.max(scores)]
+}
+
+# Re-genotype a candidate on its full collapsed region [m_start, m_end] using a
+# fresh local PCA of the whole region. Returns NULL if the 3-cluster solution
+# does not pass (caller then keeps the fragment-based genotype).
+regenotype_region <- function(chr, m_start, m_end, sample_ids) {
+  if (is.na(m_start) || is.na(m_end)) return(NULL)
+  rid        <- paste(chr, as.integer(m_start), as.integer(m_end), sep = "_")
+  raw_prefix <- file.path("breakpoints/regeno", rid)
+  cmd <- sprintf(
+    "plink2 --bfile vcf/%s --chr %s --from-bp %d --to-bp %d --allow-extra-chr --export A --threads 4 --out %s 2>/dev/null",
+    chr, chr, as.integer(m_start), as.integer(m_end), raw_prefix)
+  if (system(cmd) != 0) return(NULL)
+  raw_file <- paste0(raw_prefix, ".raw")
+  if (!file.exists(raw_file) || file.info(raw_file)$size == 0) return(NULL)
+
+  tryCatch({
+    lpca <- make_lpca_table(raw_file)
+    r <- cluster_local_pca_gaps(lpca,
+      min_cluster_n = min_cluster_n, min_search_n = min_search_n,
+      min_gap_scaled_cutoff = min_gap_scaled_cutoff,
+      gap_product_scaled_cutoff = gap_prod_scaled_cutoff,
+      dip_p_thresh = dip_p_thresh, r2_k3_min = r2_k3_min,
+      cor_h_axis_max = cor_h_axis_max, min_inv_freq = min_inv_freq)
+    cc <- classify_local_pca_cluster(r)
+    hc <- test_heterozygosity(r$data, p_cutoff = het_p_cutoff, min_group_n = het_min_group_n)
+    if (!isTRUE(cc$cluster_pass) || !isTRUE(hc$het_pass)) return(NULL)  # failed -> fallback
+    sc <- r$selected_score; bd <- r$bounds; ax <- r$selected_axis
+    scores <- lpca[[ax]]
+    geno   <- ifelse(scores < bd$L_end, 0L, ifelse(scores < bd$MID_end, 1L, 2L))
+    list(
+      geno      = setNames(as.integer(geno), lpca$IID),
+      lpca_axis = ax, L_end = bd$L_end, MID_end = bd$MID_end,
+      stats = data.table(
+        cluster_pass = cc$cluster_pass, het_pass = hc$het_pass,
+        min_gap_scaled = sc$min_gap_scaled, gap_product_scaled = sc$gap_product_scaled,
+        n_L = sc$n_L, n_MID = sc$n_MID, n_R = sc$n_R,
+        mean_H_L = hc$mean_H_L, mean_H_MID = hc$mean_H_MID, mean_H_R = hc$mean_H_R,
+        p_mid_gt_L = hc$p_mid_gt_L, p_mid_gt_R = hc$p_mid_gt_R, p_mid_gt_homs = hc$p_mid_gt_homs,
+        R2_k3 = sc$R2_k3, dip_p = sc$dip_p,
+        cor_H_axis_L = sc$cor_H_axis_L, cor_H_axis_R = sc$cor_H_axis_R,
+        maf = sc$maf, F_IS = sc$F_IS))
+  }, error = function(e) { message("    re-genotype failed: ", e$message); NULL })
+}
+
+# Reactive end-trim for a failed merge. When a multi-fragment union does NOT
+# re-cluster, iteratively drop the WORST END fragment and re-genotype the shrunken
+# span. Only END members matter: regenotype_region() re-clusters the contiguous span
+# [min bp_start, max bp_end] over ALL SNPs in it, so dropping an interior member
+# changes neither the span nor the SNP set (a no-op) — only the leftmost/rightmost
+# fragment moves a boundary. "Worst" = the end fragment with the lowest mean |r| to
+# the rest of the current core (the foreign-locus signature). Returns status "kept"
+# with the surviving core + the dropped ends, or "reverted" if no trimmed core
+# re-clusters. geno_tab = Section-C genotypes (the vectors that formed the group).
+trim_regenotype <- function(chr, member_ids, bp_tab, geno_tab, samp_ids) {
+  meta <- rbindlist(lapply(member_ids, function(rid) {
+    r <- bp_tab[region_id == rid]
+    if (!nrow(r)) return(NULL)
+    data.table(region_id = rid, bp_start = r$bp_start[1], bp_end = r$bp_end[1])
+  }))
+  if (!nrow(meta)) return(list(status = "reverted", dropped = character(0)))
+  setorder(meta, bp_start)
+  geno_of <- function(rid) as.numeric(geno_tab[[rid]])
+
+  dropped <- character(0)
+  repeat {
+    m_start <- min(meta$bp_start, na.rm = TRUE)
+    m_end   <- max(meta$bp_end,   na.rm = TRUE)
+    rg      <- regenotype_region(chr, m_start, m_end, samp_ids)
+    if (!is.null(rg))
+      return(list(status = "kept", members = meta$region_id,
+                  m_start = m_start, m_end = m_end, rg = rg, dropped = dropped))
+    if (nrow(meta) <= 2L) break          # a 2-member core already failed — nothing to salvage
+
+    # mean |r| of each END fragment to the rest of the current core; drop the lower
+    ends <- c(meta$region_id[1L], meta$region_id[nrow(meta)])
+    core_cor <- vapply(ends, function(e) {
+      others <- setdiff(meta$region_id, e)
+      ge <- geno_of(e)
+      v  <- vapply(others, function(o)
+        abs(suppressWarnings(cor(ge, geno_of(o), use = "pairwise.complete.obs"))),
+        numeric(1))
+      mean(v, na.rm = TRUE)
+    }, numeric(1))
+    core_cor[!is.finite(core_cor)] <- -Inf       # a non-correlating end is the most foreign
+    worst   <- ends[which.min(core_cor)]
+    dropped <- c(dropped, worst)
+    meta    <- meta[region_id != worst]
+  }
+  list(status = "reverted", dropped = dropped)
 }
 
 # =============================================================
@@ -668,7 +794,10 @@ cat(sprintf("  %d individuals, %d SNPs\n", N_IND, N_SNPS))
 cat(sprintf("  Loading genotype matrix...\n"))
 gt_full <- as.matrix(bg)
 
-# Windows
+# Windows: fixed physical size (window_size bp) along the chromosome. SNP count
+# per window varies with local density; windows with fewer than min_snps SNPs are
+# excluded (sparse windows give unstable local PCA). bp windows give a location-
+# stable size floor (min detectable SV ~= MIN_WIN x window_size).
 win_start  <- seq(1L, chr_len, by = window_size)
 win_end    <- pmin(win_start + window_size - 1L, chr_len)
 N_WIN      <- length(win_start)
@@ -728,25 +857,68 @@ rm(es_valid, pcdist, mds_fit); gc()
 # Candidate detection
 axes  <- paste0("MDS", seq_len(k))
 cands <- detect_candidates(mds_out, axes, z_thresh, window_gap, min_win, n_perm, perm_p)
+if (!is.null(cands)) cands[, candidate_source := "mds"]
+
+# ---- Optional manual candidates -------------------------------------------
+# chr,start,end (1-based, no header) injected here, BEFORE the empty-candidate
+# early-exit, so they are tested even on chromosomes the MDS scan flags as empty.
+# axis="manual"/dir=NA (Section B re-derives its own local-PCA axis); detection
+# stats are NA. They still face the Section B cluster/het gates — manual injection
+# bypasses DETECTION only, not validation.
+manual_path <- Sys.getenv("MANUAL_CANDIDATES")
+if (nzchar(manual_path) && file.exists(manual_path) && file.info(manual_path)$size > 0) {
+  cur_chr <- chr
+  mc <- tryCatch(
+    fread(manual_path, header = FALSE,
+          colClasses = c("character", "integer", "integer"),
+          col.names = c("chr", "start", "end")),
+    error = function(e) { message("  WARNING: could not read MANUAL_CANDIDATES (",
+                                  e$message, ") — skipping"); NULL })
+  if (!is.null(mc)) {
+    mc <- mc[chr == cur_chr]
+    if (nrow(mc)) {
+      mc[, `:=`(axis = "manual", dir = NA_character_,
+                n_windows = NA_integer_, K = NA_integer_, run_floor = NA_integer_,
+                peak_z = NA_real_, mean_z = NA_real_, sd_z = NA_real_,
+                max_gap_windows = NA_integer_, perm_p = NA_real_,
+                candidate_source = "manual")]
+      cands <- if (is.null(cands)) mc else rbindlist(list(cands, mc), fill = TRUE)
+      cat(sprintf("  Injected %d manual candidate(s) on %s\n", nrow(mc), cur_chr))
+    }
+  }
+}
 
 # Write candidates (empty or populated)
 empty_cands <- data.table(chr=character(), start=integer(), end=integer(),
                            axis=character(), dir=character(),
-                           n_windows=integer(), K=integer(),
+                           n_windows=integer(), K=integer(), run_floor=integer(),
                            peak_z=numeric(), mean_z=numeric(), sd_z=numeric(),
-                           max_gap_windows=integer(), perm_p=numeric())
+                           max_gap_windows=integer(), perm_p=numeric(),
+                           candidate_source=character())
 if (is.null(cands) || !nrow(cands)) {
   cat(sprintf("  No candidates on %s\n", chr))
   fwrite(empty_cands, sprintf("mds/candidates/%s.candidates.tsv", chr), sep = "\t")
   quit(status = 0)
 }
+
+# Stable, UNIQUE region_id per candidate ROW (coordinate-based; suffixed _2,_3,... on
+# any coordinate collision — e.g. a manual region coinciding with an MDS one — so
+# region_id is never a duplicated key in Sections B-D2 rownames/colnames/lists).
+# region_ids[] is row-aligned to cands and drives both the export and per-row loops.
+region_ids <- paste(cands$chr, cands$start, cands$end, sep = "_")
+if (anyDuplicated(region_ids))
+  region_ids <- ave(region_ids, region_ids, FUN = function(x)
+    if (length(x) == 1L) x else paste0(x, c("", paste0("_", 2:length(x)))))
+
 fwrite(cands, sprintf("mds/candidates/%s.candidates.tsv", chr), sep = "\t", quote = FALSE)
-cat(sprintf("  Detected %d candidate rows\n", nrow(cands)))
+cat(sprintf("  Candidate rows: %d (mds=%d, manual=%d)\n", nrow(cands),
+            sum(cands$candidate_source == "mds"), sum(cands$candidate_source == "manual")))
 
 # MDS plots per candidate
 for (i in seq_len(nrow(cands))) {
   cand    <- cands[i]
   ax_col  <- cand$axis
+  if (!ax_col %in% names(mds_out)) ax_col <- "MDS1"   # manual candidates: show on MDS1
   out_png <- sprintf("mds/plots/%s_%d_%d_%s_%s.png",
                      chr, cand$start, cand$end, cand$axis, cand$dir)
   tryCatch({
@@ -771,11 +943,10 @@ cat(sprintf("[%s] Section A complete\n", ts()))
 # =============================================================
 cat(sprintf("[%s] === Section B: Local PCA ===\n", ts()))
 
-# PLINK export for each unique candidate region
-unique_regions <- unique(cands[, .(chr, start, end)])
-for (j in seq_len(nrow(unique_regions))) {
-  ur  <- unique_regions[j]
-  rid <- paste(ur$chr, ur$start, ur$end, sep = "_")
+# PLINK export — one .raw per region_id (region_ids[] is unique and row-aligned to
+# cands; duplicate-coordinate candidates export separately to distinct files).
+for (j in seq_len(nrow(cands))) {
+  ur <- cands[j]; rid <- region_ids[j]
   cmd <- sprintf(
     "plink2 --bfile vcf/%s --chr %s --from-bp %d --to-bp %d --allow-extra-chr --export A --threads 4 --out local_pca/raw/%s 2>/dev/null",
     ur$chr, ur$chr, ur$start, ur$end, rid)
@@ -786,7 +957,7 @@ for (j in seq_len(nrow(unique_regions))) {
 summary_rows <- vector("list", nrow(cands))
 for (i in seq_len(nrow(cands))) {
   cand_row  <- cands[i]
-  region_id <- paste(cand_row$chr, cand_row$start, cand_row$end, sep = "_")
+  region_id <- region_ids[i]
   raw_file  <- sprintf("local_pca/raw/%s.raw", region_id)
   lpca_file <- sprintf("local_pca/tables/%s_lpca.tsv", region_id)
   ax_file   <- sprintf("local_pca/axis_scores/%s_axis_scores.tsv", region_id)
@@ -804,8 +975,7 @@ for (i in seq_len(nrow(cands))) {
       min_gap_scaled_cutoff = min_gap_scaled_cutoff,
       gap_product_scaled_cutoff = gap_prod_scaled_cutoff,
       dip_p_thresh = dip_p_thresh, r2_k3_min = r2_k3_min,
-      cor_h_axis_max = cor_h_axis_max, min_inv_freq = min_inv_freq,
-      prefer_unrotated = prefer_unrotated, unrotated_margin = unrotated_margin)
+      cor_h_axis_max = cor_h_axis_max, min_inv_freq = min_inv_freq)
     cc <- classify_local_pca_cluster(res)
     hc <- test_heterozygosity(res$data, p_cutoff = het_p_cutoff, min_group_n = het_min_group_n)
     fwrite(res$axis_scores, ax_file, sep = "\t")
@@ -860,7 +1030,7 @@ if (nrow(passing) == 1) {
   sample_ids <- names(geno_list[[1]])
   geno_mat   <- do.call(rbind, lapply(geno_list, `[`, sample_ids))
   rownames(geno_mat) <- passing$region_id
-  collapsed  <- collapse_candidates(passing, geno_mat)
+  collapsed  <- collapse_candidates(passing, geno_mat, r_thresh = r_thresh)
 }
 
 cat(sprintf("  Collapsed: %d candidates\n", nrow(collapsed)))
@@ -923,7 +1093,7 @@ for (i in seq_len(nrow(collapsed))) {
     }
 
     bps <- find_breakpoints(profile, cand$start, cand$end,
-                            ld_min_snr = ld_min_snr)
+                            ld_min_snr = ld_min_snr, ld_ext_frac = ld_ext_frac)
     fwrite(profile, sprintf("breakpoints/%s_%s_ld_profile.tsv", chr, region_id),
            sep = "\t", quote = FALSE)
     cbind(cand, data.table(bp_start = bps$bp_start, bp_end = bps$bp_end,
@@ -945,12 +1115,12 @@ cat(sprintf("[%s] === Section D2: Second collapse + plotting ===\n", ts()))
 
 if (nrow(bp_table) > 1) {
   d2      <- collapse_candidates_bp(bp_table, geno_wide_full,
-                                    buffer_frac = collapse_buffer)
+                                    r_thresh = r_thresh_long, max_gap = collapse_buffer)
   final_cands  <- d2$collapsed
   bp_annotated <- merge(bp_table, d2$merge_map, by = "region_id", all.x = TRUE)
 } else {
-  bp_table[, c("merged_start","merged_end","n_merged") :=
-             .(bp_start, bp_end, 1L)]
+  bp_table[, c("merged_start","merged_end","n_merged","merged_regions") :=
+             .(bp_start, bp_end, 1L, region_id)]
   final_cands  <- copy(bp_table)
   bp_annotated <- copy(bp_table)
 }
@@ -958,33 +1128,152 @@ if (nrow(bp_table) > 1) {
 cat(sprintf("  After second collapse: %d candidates (from %d)\n",
             nrow(final_cands), nrow(bp_table)))
 
-# Write final breakpoints (one row per post-second-collapse candidate)
+# -------------------------------------------------------------
+# Re-genotype each collapsed survivor on its full region [merged_start, merged_end]
+# and VALIDATE the merge:
+#   PASS                 -> keep the merge as one candidate; adopt the whole-region
+#                           genotype + stats (genotype_source = "merged").
+#   FAIL & n_merged > 1  -> REVERT the long-range merge: emit each constituent fragment
+#                           as its own candidate, restoring the fragment's coordinates
+#                           and Section-C genotype (genotype_source = "fragment_reverted").
+#                           A long-range join survives only if the union re-clusters as
+#                           one inversion; otherwise it is undone, COORDINATES INCLUDED.
+#   FAIL & n_merged == 1 -> singleton whose LD-refined region did not re-cluster; keep it
+#                           with its fragment genotype (genotype_source = "fragment").
+# A reverted merge expands one row into several, so final_cands is rebuilt below rather
+# than mutated in place.
+# -------------------------------------------------------------
+dir.create("breakpoints/regeno", showWarnings = FALSE, recursive = TRUE)
+samp_ids <- geno_wide_full$sample
+
+out_rows <- list(); out_geno <- list()
+n_pass <- 0L; n_revert <- 0L; n_trim <- 0L
+for (i in seq_len(nrow(final_cands))) {
+  fc <- final_cands[i]
+  rg <- regenotype_region(chr, fc$merged_start, fc$merged_end, samp_ids)
+
+  if (!is.null(rg)) {
+    # Union re-clusters -> keep the (possibly merged) candidate, adopt whole-region call
+    row <- copy(fc)
+    row[, genotype_source := "merged"]
+    row[, lpca_axis := rg$lpca_axis]
+    if ("L_end"   %in% names(row)) row[, L_end   := rg$L_end]
+    if ("MID_end" %in% names(row)) row[, MID_end := rg$MID_end]
+    for (cn in names(rg$stats))
+      if (cn %in% names(row)) row[, (cn) := rg$stats[[cn]]]
+    out_rows[[length(out_rows) + 1L]] <- row
+    out_geno[[length(out_geno) + 1L]] <- as.integer(rg$geno[samp_ids])
+    n_pass <- n_pass + 1L
+
+  } else if (isTRUE(fc$n_merged > 1L)) {
+    # Union fails -> REACTIVE END-TRIM before reverting. Peel the worst end fragment
+    # (least correlated with the core) and re-genotype the shrunken span; keep the
+    # surviving core as a merge and emit the peeled end(s) as singletons. Only if no
+    # trimmed core re-clusters do we fall back to the full revert.
+    member_ids <- strsplit(as.character(fc$merged_regions), ",")[[1]]
+    tr <- trim_regenotype(chr, member_ids, bp_table, geno_wide_full, samp_ids)
+
+    if (isTRUE(tr$status == "kept") && length(tr$members) >= 2L &&
+        length(tr$dropped) > 0L) {
+      # Trimmed core re-clusters -> keep it (whole-region call on the trimmed span);
+      # label it with the best-clustering surviving fragment (a survivor, so its id
+      # never collides with a dropped piece's row).
+      rg     <- tr$rg
+      surv   <- bp_table[region_id %in% tr$members]
+      rep_id <- surv[order(-R2_k3)][1]$region_id
+      row <- copy(fc)
+      row[, `:=`(region_id       = rep_id,
+                 merged_start    = tr$m_start,
+                 merged_end      = tr$m_end,
+                 merged_regions  = paste(tr$members, collapse = ","),
+                 n_merged        = length(tr$members),
+                 genotype_source = "merged_trimmed",
+                 lpca_axis       = rg$lpca_axis)]
+      if ("L_end"   %in% names(row)) row[, L_end   := rg$L_end]
+      if ("MID_end" %in% names(row)) row[, MID_end := rg$MID_end]
+      for (cn in names(rg$stats))
+        if (cn %in% names(row)) row[, (cn) := rg$stats[[cn]]]
+      out_rows[[length(out_rows) + 1L]] <- row
+      out_geno[[length(out_geno) + 1L]] <- as.integer(rg$geno[samp_ids])
+      n_pass <- n_pass + 1L
+
+      # peeled end fragment(s) -> singletons (own coords + Section-C genotype)
+      for (frid in tr$dropped) {
+        frow <- bp_table[region_id == frid]
+        if (!nrow(frow)) next
+        frow <- copy(frow[1])
+        frow[, `:=`(merged_start    = bp_start,
+                    merged_end      = bp_end,
+                    n_merged        = 1L,
+                    merged_regions  = region_id,
+                    genotype_source = "fragment_trimmed")]
+        out_rows[[length(out_rows) + 1L]] <- frow
+        out_geno[[length(out_geno) + 1L]] <- as.integer(geno_wide_full[[frid]])
+      }
+      n_trim <- n_trim + length(tr$dropped)
+
+    } else {
+      # No trimmed core re-clusters -> REVERT: restore each constituent fragment
+      for (frid in strsplit(as.character(fc$merged_regions), ",")[[1]]) {
+        frow <- bp_table[region_id == frid]
+        if (!nrow(frow)) next
+        frow <- copy(frow[1])
+        frow[, `:=`(merged_start    = bp_start,
+                    merged_end      = bp_end,
+                    n_merged        = 1L,
+                    merged_regions  = region_id,
+                    genotype_source = "fragment_reverted")]
+        out_rows[[length(out_rows) + 1L]] <- frow
+        out_geno[[length(out_geno) + 1L]] <- as.integer(geno_wide_full[[frid]])
+      }
+      n_revert <- n_revert + 1L
+    }
+
+  } else {
+    # Singleton whose LD-refined region did not re-cluster -> keep fragment genotype
+    row <- copy(fc)
+    row[, genotype_source := "fragment"]
+    out_rows[[length(out_rows) + 1L]] <- row
+    out_geno[[length(out_geno) + 1L]] <- as.integer(geno_wide_full[[fc$region_id]])
+  }
+}
+final_cands     <- rbindlist(out_rows, fill = TRUE)
+geno_cols_final <- out_geno
+cat(sprintf("  Region re-genotyping: %d merge(s)/region(s) kept, %d end-fragment(s) trimmed, %d merge(s) reverted -> %d final candidates\n",
+            n_pass, n_trim, n_revert, nrow(final_cands)))
+
+# Write final breakpoints (now includes genotype_source + whole-region stats)
 fwrite(final_cands, sprintf("breakpoints/%s.breakpoints.tsv", chr),
        sep = "\t", quote = FALSE)
 
-# Write final genotype matrix (representative per merged group)
-samp_ids   <- geno_wide_full$sample
-geno_final <- cbind(
-  data.table(sample = samp_ids),
-  as.data.table(do.call(cbind, lapply(seq_len(nrow(final_cands)), function(i)
-    as.numeric(geno_wide_full[[final_cands$region_id[i]]])))))
+# Write final genotype matrix (whole-region genotype where re-genotyping passed)
+geno_final <- cbind(data.table(sample = samp_ids),
+                    as.data.table(do.call(cbind, geno_cols_final)))
 setnames(geno_final, c("sample", final_cands$region_id))
 fwrite(geno_final, sprintf("breakpoints/%s.genotypes.tsv", chr),
        sep = "\t", quote = FALSE)
 
-# One plot per fragment (bp_annotated has one row per pre-D2 candidate)
+# -------------------------------------------------------------
+# Plots: one per final candidate, on its best supporting axis (highest
+# mean |Z| over the region), showing every collapsed fragment's MDS
+# (blue) and LD-refined (red) bars plus the merged union (green).
+# -------------------------------------------------------------
 n_plots <- 0L
-for (i in seq_len(nrow(bp_annotated))) {
-  row     <- bp_annotated[i]
-  out_png <- sprintf("breakpoints/plots/%s_%s.png", chr, row$region_id)
+for (i in seq_len(nrow(final_cands))) {
+  fc       <- final_cands[i]
+  frag_ids <- strsplit(as.character(fc$merged_regions), ",")[[1]]
+  frags    <- bp_annotated[region_id %in% frag_ids, .(start, end, bp_start, bp_end)]
+  if (!nrow(frags))
+    frags <- bp_annotated[region_id == fc$region_id, .(start, end, bp_start, bp_end)]
+  sup_axes <- strsplit(as.character(fc$supporting_axes), ",")[[1]]
+  best_ax  <- best_axis_for_region(mds_out, fc$merged_start, fc$merged_end, sup_axes)
+  if (is.na(best_ax) || !best_ax %in% names(mds_out)) best_ax <- "MDS1"   # manual-only: MDS1
+  out_png  <- sprintf("breakpoints/plots/%s_%s.png", chr, fc$region_id)
   tryCatch({
     plot_mds_with_breakpoints(
-      mds_out, chr,
-      row$start, row$end,
-      row$bp_start, row$bp_end,
-      row$merged_start, row$merged_end,
-      n_merged = if (!is.null(row$n_merged) && !is.na(row$n_merged)) row$n_merged else 1L,
-      row$axis, row$dir, out_png)
+      mds_out, chr, frags, fc$merged_start, fc$merged_end,
+      n_merged = if (!is.null(fc$n_merged) && !is.na(fc$n_merged)) fc$n_merged else 1L,
+      axis = best_ax, dir = fc$dir, out_file = out_png)
     n_plots <- n_plots + 1L
   }, error = function(e) message("  Plot failed: ", e$message))
 }
